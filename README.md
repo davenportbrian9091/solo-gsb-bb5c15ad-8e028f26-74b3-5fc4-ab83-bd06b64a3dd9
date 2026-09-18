@@ -6,6 +6,9 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 搜索生成**确定性锁定清单**；无解时返回从根需求到冲突包的**约束来源链**。
 `/upgrade` 在现有锁定清单（`current_lock`）上升级单个目标包：取能完成
 整体解析的最高版本，并最小化其余包相对当前锁的变更数量。
+`/audit-lock` 复用同一快照/根包/目标环境/根约束与 `current_lock`，
+**只审计不重新求解**：按锁定版本遍历已激活依赖，校验可达性、版本可用性
+与全部入边约束，返回 `valid` 与确定性排序的 `issues`。
 
 - **无远程访问**：不访问 PyPI 或任何索引，不做磁盘缓存，全部数据在请求内存中处理。
 - **目标环境随请求给定**：每条依赖可携带 PEP 508 marker，由请求必填的
@@ -17,6 +20,9 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 - **最小变更升级**：`/upgrade` 只考虑严格高于当前版本的目标候选，取能完成
   整体解析的最高版本；该版本下在所有有效解中优先选择非目标包相对
   `current_lock` 新增/删除/版本变化数量最少的解。
+- **锁定清单审计**：`/audit-lock` 以锁定版本为事实遍历依赖图（环上包只展开
+  一次，但累计所有入边约束），报告 `missing` / `unavailable` /
+  `constraint_mismatch` / `extraneous` 四类问题，不修改、不重新求解。
 - **环安全**：依赖环（含自环、菱形依赖）不会导致重复展开；环上的新约束仍会校验。
 - **确定性**：结果只取决于快照内容与目标环境，与包键顺序、候选列表顺序无关。
 
@@ -35,6 +41,7 @@ docker compose up --build
 | API 根地址 | `http://localhost:8000` |
 | 解析接口 | `POST http://localhost:8000/resolve` |
 | 升级接口 | `POST http://localhost:8000/upgrade` |
+| 审计接口 | `POST http://localhost:8000/audit-lock` |
 | 健康检查 | `GET  http://localhost:8000/healthz` |
 | 交互文档（Swagger） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
@@ -334,6 +341,85 @@ curl -s -X POST http://localhost:8000/upgrade \
 | `409` | 无可行升级（没有严格更高的候选，或所有更高候选都无法完成整体解析，`status: "conflict"` 并附冲突来源链）；或搜索超过内置尝试上限（`status: "limit"`） |
 | `422` | 请求/快照非法（同 `/resolve`），或 `target` 不存在于 `current_lock` 中、`current_lock` 含非法 PEP 440 版本 |
 
+### `POST /audit-lock`
+
+审计现有锁定清单与快照/约束的一致性，**只审计、不重新求解**。请求体包含
+`/resolve` 的全部字段（`repository` / `root` / `target_environment` /
+`specifier` / `allow_prereleases`，语义完全一致），并附加一个字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `current_lock` | `object` | 是 | 待审计的锁定清单：`{包名: 版本}`；包名按 PEP 503 规范化匹配，版本须为合法 PEP 440 |
+
+审计规则：
+
+1. 以 `current_lock` 的锁定版本为事实，从根包出发沿**已激活**依赖
+   （marker 在 `target_environment` 下为真）遍历可达图；
+2. 每个包只展开一次（环/自环/菱形安全），但其**所有入边约束**都会累计，
+   遍历结束后统一校验——环上后到的约束同样参与判定；
+3. 锁定版本按 **PEP 440 等价性**与快照候选匹配（`1.0` 与 `1.0.0` 视为
+   同一版本）；约束满足性判定与求解器一致（预发布遵循
+   `allow_prereleases`）；
+4. `missing` / `unavailable` 的包无法展开其依赖（版本未知或不在快照），
+   其下游锁中包会因此记为 `extraneous`；`constraint_mismatch` 的包仍按
+   锁定版本继续展开，保证下游诊断完整；
+5. 审计不修改任何内容，也不与 `/resolve` 的择优逻辑比较：锁定版本不是
+   最高候选、但只要满足全部约束即为有效。
+
+`issues` 中每项的 `kind` 取值固定为：
+
+| kind | 含义 |
+| --- | --- |
+| `missing` | 可达的包未出现在 `current_lock` 中（`locked_version` 为 `null`） |
+| `unavailable` | 锁定版本不在仓库快照中（按 PEP 440 等价性判断） |
+| `constraint_mismatch` | 锁定版本不满足根约束（`specifier`）或任一入边依赖约束 |
+| `extraneous` | `current_lock` 中的包从根不可达（`constraints` 恒为空表） |
+
+每项包含 `package`（规范化包名）、`locked_version` 与 `constraints`
+（该包累计的全部入边约束，`from` 为 `root` 或 `包==版本`，按
+`(from, specifier)` 排序）。`issues` 整体按 `(package, kind)` 确定性排序；
+无问题时返回 `valid: true`。
+
+```bash
+curl -s -X POST http://localhost:8000/audit-lock \
+  -H 'Content-Type: application/json' \
+  -d @examples/audit-lock.json
+```
+
+示例中 `shared-util` 锁定 `2.0.0`，违反了 `web-framework==2.4.0` 的
+`>=1.0,<2.0` 与 `auth-lib==0.9.0` 的 `<2.0`；`leftover-lib` 不被任何
+已激活依赖引用：
+
+```json
+{
+  "valid": false,
+  "issues": [
+    {
+      "kind": "extraneous",
+      "package": "leftover-lib",
+      "locked_version": "0.3.0",
+      "constraints": []
+    },
+    {
+      "kind": "constraint_mismatch",
+      "package": "shared-util",
+      "locked_version": "2.0.0",
+      "constraints": [
+        {"from": "auth-lib==0.9.0", "specifier": "<2.0"},
+        {"from": "web-framework==2.4.0", "specifier": ">=1.0,<2.0"}
+      ]
+    }
+  ]
+}
+```
+
+`/audit-lock` 的状态码：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 审计完成：`valid` 表示锁定清单是否通过，`issues` 列出全部问题 |
+| `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本 |
+
 ---
 
 ## 三、解析规则说明
@@ -358,6 +444,12 @@ curl -s -X POST http://localhost:8000/upgrade \
    解析的版本；随后在该版本的所有有效解中枚举并保留“非目标包相对
    `current_lock` 变化数量最少”的解（分支定界剪枝，变化数相同按既定
    确定性顺序取先遇到者）。`/resolve` 的行为不受任何影响。
+10. **审计（`/audit-lock`）**：不求解、不择优。从根包按锁定版本遍历已激活
+    依赖（每包只展开一次），累计每个包的全部入边约束后统一校验：可达未锁
+    记 `missing`，锁定版本不在快照记 `unavailable`，锁定版本违反根约束或
+    任一入边约束记 `constraint_mismatch`，锁中不可达记 `extraneous`。
+    版本匹配用 PEP 440 等价性，包名用 PEP 503 规范化，预发布语义与求解器
+    一致；`issues` 按 `(package, kind)` 排序，结果确定。
 
 ### 安全护栏
 
@@ -371,10 +463,11 @@ curl -s -X POST http://localhost:8000/upgrade \
 app/
   main.py        # FastAPI 路由与错误映射
   resolver.py    # 回溯求解器（候选排序 / MRV / 来源链重建）
+  audit.py       # 锁定清单审计器（/audit-lock：遍历可达图并校验入边约束）
   repository.py  # 快照规范化、PEP 440/503 解析、按环境过滤 marker
   markers.py     # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
   schemas.py     # 请求/响应模型
-examples/        # curl 示例请求体（含跨环境 marker 与 /upgrade 示例）
+examples/        # curl 示例请求体（含跨环境 marker、/upgrade 与 /audit-lock 示例）
 tests/           # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
 Dockerfile
 docker-compose.yml

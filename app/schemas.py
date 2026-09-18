@@ -128,6 +128,20 @@ class UpgradeRequest(ResolveRequest):
     )
 
 
+class AuditLockRequest(ResolveRequest):
+    """POST /audit-lock 的请求体：/resolve 全部字段 + 待审计的锁定清单。"""
+
+    model_config = {"extra": "forbid"}
+
+    current_lock: dict[str, str] = Field(
+        ...,
+        description=(
+            "待审计的锁定清单：包名（PEP 503 规范化匹配）-> PEP 440 版本；"
+            "审计以锁定版本为事实遍历依赖图，不重新求解。"
+        ),
+    )
+
+
 # --------------------------------------------------------------------- #
 # 响应模型
 # --------------------------------------------------------------------- #
@@ -225,6 +239,52 @@ class UnresolvedResponse(BaseModel):
     status: Literal["conflict", "limit"]
     message: str
     conflicts: list[ConflictOut]
+
+
+class AuditConstraintOut(BaseModel):
+    """一条作用在被审计包上的入边约束及其来源。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    from_: str = Field(
+        ..., alias="from", description="约束来源：'root' 表示根请求，否则为 '包==版本'。"
+    )
+    specifier: str = Field(..., description="来源声明的原始约束；空约束显示为 '*'。")
+
+
+class AuditIssueOut(BaseModel):
+    """单条审计问题；每个包至多一条。"""
+
+    model_config = {"extra": "forbid"}
+
+    kind: Literal["missing", "unavailable", "constraint_mismatch", "extraneous"] = Field(
+        ...,
+        description=(
+            "missing=可达包未锁定；unavailable=锁定版本不在快照；"
+            "constraint_mismatch=锁定版本不满足根或依赖约束；"
+            "extraneous=锁中包不可达。"
+        ),
+    )
+    package: str = Field(..., description="规范化包名。")
+    locked_version: str | None = Field(
+        ..., description="current_lock 中的版本（PEP 440 规范化输出）；missing 时为 null。"
+    )
+    constraints: list[AuditConstraintOut] = Field(
+        ...,
+        description=(
+            "该包累计到的全部入边约束（含根约束），按 (from, specifier) 排序；"
+            "extraneous 不可达，恒为空表。"
+        ),
+    )
+
+
+class AuditLockResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    valid: bool = Field(..., description="issues 为空（锁定清单通过审计）时为 true。")
+    issues: list[AuditIssueOut] = Field(
+        ..., description="审计发现的问题，按 (package, kind) 确定性排序。"
+    )
 
 
 class InvalidSnapshotResponse(BaseModel):

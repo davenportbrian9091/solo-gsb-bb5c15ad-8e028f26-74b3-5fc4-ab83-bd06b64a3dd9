@@ -5,6 +5,9 @@
 * POST /upgrade  在 /resolve 语义基础上附加 current_lock 与单个升级目标：
   仅考虑严格高于当前版本的候选，取能完成整体解析的最高版本，并在该版本
   的所有有效解中最小化非目标包相对 current_lock 的变化数量
+* POST /audit-lock  复用同一快照/根包/目标环境/根约束与 current_lock，
+  只审计不重新求解：按锁定版本遍历已激活依赖，校验可达性、版本可用性
+  与全部入边约束，返回 valid 与确定性排序的 issues
 * GET  /healthz  健康检查
 """
 
@@ -14,6 +17,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from packaging.version import Version
 
+from .audit import find_lock_issues
 from .repository import (
     SnapshotError,
     build_repository,
@@ -23,6 +27,8 @@ from .repository import (
 )
 from .resolver import ResolutionLimit, Resolver
 from .schemas import (
+    AuditLockRequest,
+    AuditLockResponse,
     InvalidSnapshotResponse,
     ResolveRequest,
     ResolveResponse,
@@ -38,7 +44,7 @@ app = FastAPI(
         "所有仓库数据与目标环境随请求提交，本地解析，不访问任何远程索引、"
         "不读取宿主机平台信息。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -224,3 +230,45 @@ def upgrade(request: UpgradeRequest):
         "locked": locked,
         "changes": _lock_changes(current_lock, locked),
     }
+
+
+@app.post(
+    "/audit-lock",
+    summary="审计锁定清单与快照/约束的一致性（不重新求解）",
+    response_model=AuditLockResponse,
+    responses={
+        422: {"model": InvalidSnapshotResponse, "description": "快照、current_lock 或请求非法"},
+    },
+)
+def audit_lock(request: AuditLockRequest):
+    root_canonical = canonical(request.root)
+    payload = request.model_dump()
+
+    try:
+        repo = build_repository(payload["repository"], payload["target_environment"])
+        root_spec = parse_root_specifier(request.specifier)
+        current_lock = parse_current_lock(payload["current_lock"])
+    except SnapshotError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "invalid_snapshot", "message": str(exc)},
+        )
+
+    if not repo.known(root_canonical):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": f"根包 {root_canonical!r} 不存在于仓库快照中",
+            },
+        )
+
+    issues = find_lock_issues(
+        repo,
+        root_canonical,
+        root_spec,
+        request.specifier,
+        current_lock,
+        allow_prereleases=request.allow_prereleases,
+    )
+    return {"valid": not issues, "issues": issues}

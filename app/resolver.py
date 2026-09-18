@@ -119,6 +119,22 @@ class ConflictReport:
     partial_selection: dict[str, str]
 
 
+def version_satisfies(
+    version: Version, spec: SpecifierSet, allow_prereleases: bool
+) -> bool:
+    """pip 跟随语义：默认排除预发布（dev/a/b/rc），除非约束谓词里显式
+    提到了预发布版本（如 ==1.0a1，此时该谓词 prereleases=True）。
+
+    求解器与 /audit-lock 的约束校验共用本函数，保证语义一致。
+    """
+    if allow_prereleases:
+        return version in spec
+    if version.is_prerelease or version.is_devrelease:
+        if not any(s.prereleases for s in spec):
+            return False
+    return version in spec
+
+
 def _combined_spec(reqs: list[Requirement]) -> SpecifierSet:
     spec = SpecifierSet()
     for r in reqs:
@@ -189,14 +205,7 @@ class Resolver:
     # 版本匹配
     # ------------------------------------------------------------------ #
     def _version_satisfies(self, version: Version, spec: SpecifierSet) -> bool:
-        if self.allow_prereleases:
-            return version in spec
-        # pip 跟随语义：默认排除预发布（dev/a/b/rc），除非约束谓词里显式
-        # 提到了预发布版本（如 ==1.0a1，此时该谓词 prereleases=True）。
-        if version.is_prerelease or version.is_devrelease:
-            if not any(s.prereleases for s in spec):
-                return False
-        return version in spec
+        return version_satisfies(version, spec, self.allow_prereleases)
 
     def _eligible(self, subject: str, spec: SpecifierSet) -> list[Candidate]:
         # 仓库候选已按版本降序排列，过滤后顺序不变。
