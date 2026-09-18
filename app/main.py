@@ -1,11 +1,13 @@
 """FastAPI 入口：全部数据随请求在本地内存中处理。
 
-* POST /resolve  提交仓库快照 + 根包 + 版本约束 + 目标环境（PEP 508 marker
+* POST /resolve     提交仓库快照 + 根包 + 版本约束 + 目标环境（PEP 508 marker
   在请求环境下求值），返回锁定清单或冲突来源链
-* POST /upgrade  在 /resolve 语义基础上附加 current_lock 与单个升级目标：
+* POST /upgrade     在 /resolve 语义基础上附加 current_lock 与单个升级目标：
   仅考虑严格高于当前版本的候选，取能完成整体解析的最高版本，并在该版本
   的所有有效解中最小化非目标包相对 current_lock 的变化数量
-* GET  /healthz  健康检查
+* POST /audit-lock  只审计不求解：按 current_lock 的锁定版本从根包遍历
+  已激活依赖，报告 missing/unavailable/constraint_mismatch/extraneous
+* GET  /healthz     健康检查
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from packaging.version import Version
 
+from .audit import audit_lock
 from .repository import (
     SnapshotError,
     build_repository,
@@ -23,6 +26,8 @@ from .repository import (
 )
 from .resolver import ResolutionLimit, Resolver
 from .schemas import (
+    AuditLockRequest,
+    AuditLockResponse,
     InvalidSnapshotResponse,
     ResolveRequest,
     ResolveResponse,
@@ -38,7 +43,7 @@ app = FastAPI(
         "所有仓库数据与目标环境随请求提交，本地解析，不访问任何远程索引、"
         "不读取宿主机平台信息。"
     ),
-    version="1.1.0",
+    version="1.2.0",
 )
 
 
@@ -224,3 +229,45 @@ def upgrade(request: UpgradeRequest):
         "locked": locked,
         "changes": _lock_changes(current_lock, locked),
     }
+
+
+@app.post(
+    "/audit-lock",
+    summary="审计现有锁定清单而不重新求解",
+    response_model=AuditLockResponse,
+    responses={
+        422: {"model": InvalidSnapshotResponse, "description": "快照或 current_lock 非法"},
+    },
+)
+def audit_lock_endpoint(request: AuditLockRequest):
+    root_canonical = canonical(request.root)
+    payload = request.model_dump()
+
+    try:
+        repo = build_repository(payload["repository"], payload["target_environment"])
+        root_spec = parse_root_specifier(request.specifier)
+        current_lock = parse_current_lock(payload["current_lock"])
+    except SnapshotError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "invalid_snapshot", "message": str(exc)},
+        )
+
+    if not repo.known(root_canonical):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "status": "invalid_snapshot",
+                "message": f"根包 {root_canonical!r} 不存在于仓库快照中",
+            },
+        )
+
+    result = audit_lock(
+        repo,
+        root_name=root_canonical,
+        root_spec=root_spec,
+        root_raw=request.specifier,
+        current_lock=current_lock,
+        allow_prereleases=request.allow_prereleases,
+    )
+    return {"status": "ok", **result}

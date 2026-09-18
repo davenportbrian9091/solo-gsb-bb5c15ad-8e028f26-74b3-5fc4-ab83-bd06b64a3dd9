@@ -158,6 +158,24 @@ def parse_root_specifier(raw: str) -> SpecifierSet:
     return _parse_specifier(raw, owner="<root request>")
 
 
+def version_satisfies(
+    version: Version, spec: SpecifierSet, *, allow_prereleases: bool = False
+) -> bool:
+    """版本是否满足 PEP 440 约束集合。
+
+    与求解器同一套 pip 跟随语义：默认排除预发布（dev/a/b/rc），除非
+    ``allow_prereleases`` 放开、或约束谓词显式提到预发布版本
+    （如 ``==1.0a1``，该谓词 ``prereleases=True``）。/resolve、/upgrade
+    的候选过滤与 /audit-lock 的锁定版本审计共用本函数。
+    """
+    if allow_prereleases:
+        return version in spec
+    if version.is_prerelease or version.is_devrelease:
+        if not any(s.prereleases for s in spec):
+            return False
+    return version in spec
+
+
 def parse_current_lock(raw: dict[str, str]) -> dict[str, Version]:
     """校验并规范化 POST /upgrade 的 current_lock：PEP 503 包名 -> PEP 440 版本。
 

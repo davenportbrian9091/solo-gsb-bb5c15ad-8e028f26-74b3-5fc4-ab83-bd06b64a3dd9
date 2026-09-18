@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
-from .repository import Candidate, Repository, canonical
+from .repository import Candidate, Repository, canonical, version_satisfies
 
 # 尝试候选版本的总次数上限，防止恶意快照造成指数级搜索。
 DEFAULT_ATTEMPT_LIMIT = 100_000
@@ -189,14 +189,9 @@ class Resolver:
     # 版本匹配
     # ------------------------------------------------------------------ #
     def _version_satisfies(self, version: Version, spec: SpecifierSet) -> bool:
-        if self.allow_prereleases:
-            return version in spec
-        # pip 跟随语义：默认排除预发布（dev/a/b/rc），除非约束谓词里显式
-        # 提到了预发布版本（如 ==1.0a1，此时该谓词 prereleases=True）。
-        if version.is_prerelease or version.is_devrelease:
-            if not any(s.prereleases for s in spec):
-                return False
-        return version in spec
+        return version_satisfies(
+            version, spec, allow_prereleases=self.allow_prereleases
+        )
 
     def _eligible(self, subject: str, spec: SpecifierSet) -> list[Candidate]:
         # 仓库候选已按版本降序排列，过滤后顺序不变。

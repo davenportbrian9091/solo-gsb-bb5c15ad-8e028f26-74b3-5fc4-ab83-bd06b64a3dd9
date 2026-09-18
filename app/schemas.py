@@ -128,6 +128,23 @@ class UpgradeRequest(ResolveRequest):
     )
 
 
+class AuditLockRequest(ResolveRequest):
+    """POST /audit-lock 的请求体：在 /resolve 全部字段上附加被审计的锁定清单。
+
+    审计不重新求解：current_lock 中的版本就是被检查的对象，而不是参照。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    current_lock: dict[str, str] = Field(
+        ...,
+        description=(
+            "被审计的锁定清单：包名（PEP 503 规范化匹配）-> PEP 440 版本；"
+            "审计从根包按这些锁定版本遍历已激活依赖，不做任何版本选择。"
+        ),
+    )
+
+
 # --------------------------------------------------------------------- #
 # 响应模型
 # --------------------------------------------------------------------- #
@@ -232,3 +249,79 @@ class InvalidSnapshotResponse(BaseModel):
 
     status: Literal["invalid_snapshot"]
     message: str
+
+
+# --------------------------------------------------------------------- #
+# POST /audit-lock 响应
+# --------------------------------------------------------------------- #
+class AuditConstraintOut(BaseModel):
+    """一条累计到被审计包上的入边约束及其来源。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    from_: str = Field(
+        ..., alias="from", description="声明方，'root' 表示根请求；否则为 'pkg==version'。"
+    )
+    specifier: str = Field(..., description="声明的原始约束；空约束显示为 '*'。")
+
+
+class AuditConstraintViolationOut(AuditConstraintOut):
+    """constraint_mismatch 中一条未被锁定版本满足的约束。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    satisfies: bool = Field(
+        ...,
+        description=(
+            "锁定版本是否满足该约束（PEP 440）；该列表中恒为 false。"
+            "missing/unavailable/extraneous 的约束不携带此字段。"
+        ),
+    )
+
+
+class AuditIssueOut(BaseModel):
+    """一条审计问题；每个包的每种类型至多一条。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    type: Literal["missing", "unavailable", "constraint_mismatch", "extraneous"] = (
+        Field(..., description=(
+            "missing=可达包未锁定；unavailable=锁定版本不在快照；"
+            "constraint_mismatch=锁定版本不满足根或依赖约束；"
+            "extraneous=锁中包不可达。"
+        ))
+    )
+    name: str = Field(..., description="问题所针对的包名（PEP 503 规范化）。")
+    locked_version: str | None = Field(
+        ..., description="锁定清单中的版本；missing 时为 null。"
+    )
+    available: list[str] = Field(
+        ...,
+        description=(
+            "快照中该包的全部可用版本（PEP 440 降序）；"
+            "包不在快照中时为空列表。"
+        ),
+    )
+    constraints: list[AuditConstraintViolationOut | AuditConstraintOut] = Field(
+        ...,
+        description=(
+            "累计到该包的全部入边约束（含根约束，已去重并按来源排序）；"
+            "constraint_mismatch 仅列出未满足的约束（逐条带 satisfies=false）；"
+            "extraneous 恒为空。"
+        ),
+    )
+
+
+class AuditLockResponse(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    status: Literal["ok"]
+    valid: bool = Field(..., description="issues 为空时为 true。")
+    issues: list[AuditIssueOut] = Field(
+        ...,
+        description=(
+            "审计问题，确定性排序：先按类型"
+            "（missing、unavailable、constraint_mismatch、extraneous），"
+            "再按规范化包名。"
+        ),
+    )

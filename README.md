@@ -6,6 +6,8 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 搜索生成**确定性锁定清单**；无解时返回从根需求到冲突包的**约束来源链**。
 `/upgrade` 在现有锁定清单（`current_lock`）上升级单个目标包：取能完成
 整体解析的最高版本，并最小化其余包相对当前锁的变更数量。
+`/audit-lock` 对现有锁定清单做**只审计、不重新求解**的自洽性检查：按锁定
+版本从根包遍历已激活依赖，报告缺失、版本不可用、约束不满足与多余的包。
 
 - **无远程访问**：不访问 PyPI 或任何索引，不做磁盘缓存，全部数据在请求内存中处理。
 - **目标环境随请求给定**：每条依赖可携带 PEP 508 marker，由请求必填的
@@ -35,6 +37,7 @@ docker compose up --build
 | API 根地址 | `http://localhost:8000` |
 | 解析接口 | `POST http://localhost:8000/resolve` |
 | 升级接口 | `POST http://localhost:8000/upgrade` |
+| 审计接口 | `POST http://localhost:8000/audit-lock` |
 | 健康检查 | `GET  http://localhost:8000/healthz` |
 | 交互文档（Swagger） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
@@ -334,6 +337,129 @@ curl -s -X POST http://localhost:8000/upgrade \
 | `409` | 无可行升级（没有严格更高的候选，或所有更高候选都无法完成整体解析，`status: "conflict"` 并附冲突来源链）；或搜索超过内置尝试上限（`status: "limit"`） |
 | `422` | 请求/快照非法（同 `/resolve`），或 `target` 不存在于 `current_lock` 中、`current_lock` 含非法 PEP 440 版本 |
 
+### `POST /audit-lock`
+
+对一份**现有锁定清单**做自洽性审计。请求体包含 `/resolve` 的全部字段
+（`repository` / `root` / `target_environment` / `specifier` /
+`allow_prereleases`，语义完全一致），并附加 `current_lock`（与 `/upgrade`
+同名同格式）：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `current_lock` | `object` | 是 | 被审计的锁定清单：`{包名: 版本}`；包名按 PEP 503 规范化匹配，版本须为合法 PEP 440 |
+
+**审计不重新求解、不选择任何版本**——版本完全由 `current_lock` 给定：
+
+1. 从根包的锁定版本出发，按目标环境展开该版本声明的**已激活**依赖
+   （marker 语义与 `/resolve` 完全一致：未激活的依赖不参与审计）；
+2. 依赖环 / 菱形中同一个包**只展开一次**，但指向它的**每一条入边约束
+   都累计核对**（环上回边的约束同样参与）；
+3. 包名按 PEP 503 规范化匹配（`Some_Pkg` ≡ `some-pkg`），版本按 PEP 440
+   等价性判断（锁中的 `1.0` 与快照中的 `1.0.0` 视为同一版本，`==1.0`
+   同样满足）；约束满足判断与求解器共用同一套 pip 预发布跟随语义。
+
+每个有问题的包产出一条 `issue`，类型固定为以下四种：
+
+| `type` | 含义 |
+| --- | --- |
+| `missing` | 该包按锁定版本的依赖图**可达**，却未出现在 `current_lock` 中（`locked_version` 为 `null`） |
+| `unavailable` | 锁定版本**不在仓库快照**中（或包完全不在快照中，`available` 为空） |
+| `constraint_mismatch` | 锁定版本**不满足根约束或任一入边依赖约束**；`constraints` 只列未满足的约束，逐条带 `"satisfies": false` |
+| `extraneous` | 锁中存在但从根包按锁定版本**不可达**的包（含仅被未激活 marker 依赖要求的包）；`constraints` 恒为空 |
+
+每条 `issue` 包含：
+
+| 字段 | 说明 |
+| --- | --- |
+| `type` | 上述四种类型之一 |
+| `name` | 规范化包名（PEP 503） |
+| `locked_version` | 锁中版本；`missing` 时为 `null` |
+| `available` | 快照中该包的全部可用版本（PEP 440 降序）；包不在快照中时为 `[]` |
+| `constraints` | 累计到该包的入边约束（含根约束，已去重并按来源排序）：每条含 `from`（`root` 或 `pkg==version`）、`specifier`（空约束显示 `*`）；仅 `constraint_mismatch` 的条目额外带 `satisfies`（恒为 `false`） |
+
+无任何问题时返回 `"valid": true` 且 `issues` 为空。`issues` **确定性排序**：
+先按类型（`missing` → `unavailable` → `constraint_mismatch` →
+`extraneous`），同类型内按规范化包名；与包键 / 候选列表的输入顺序无关。
+
+```bash
+curl -s -X POST http://localhost:8000/audit-lock \
+  -H 'Content-Type: application/json' \
+  -d @examples/audit-lock.json
+```
+
+示例快照里：`monitoring-lib` 被依赖却未锁定（missing）、`web-framework`
+锁了快照中不存在的 `3.3.0`（unavailable）、`cache-lib` 锁 `1.5.0` 不满足
+`>=2.0`（constraint_mismatch）、`stale-pkg` 完全不可达（extraneous），
+而 `win-only` 仅在 `sys_platform == 'win32'` 激活、linux 请求下不可达
+（extraneous）：
+
+```json
+{
+  "status": "ok",
+  "valid": false,
+  "issues": [
+    {
+      "type": "missing",
+      "name": "monitoring-lib",
+      "locked_version": null,
+      "available": ["1.0.0"],
+      "constraints": [
+        {"from": "app==1.0.0", "specifier": ">=1.0"}
+      ]
+    },
+    {
+      "type": "unavailable",
+      "name": "web-framework",
+      "locked_version": "3.3.0",
+      "available": ["3.2.0", "2.4.0"],
+      "constraints": [
+        {"from": "app==1.0.0", "specifier": ">=2.0"}
+      ]
+    },
+    {
+      "type": "constraint_mismatch",
+      "name": "cache-lib",
+      "locked_version": "1.5.0",
+      "available": ["2.0.0", "1.5.0"],
+      "constraints": [
+        {"from": "app==1.0.0", "specifier": ">=2.0", "satisfies": false}
+      ]
+    },
+    {
+      "type": "extraneous",
+      "name": "stale-pkg",
+      "locked_version": "0.1.0",
+      "available": [],
+      "constraints": []
+    },
+    {
+      "type": "extraneous",
+      "name": "win-only",
+      "locked_version": "1.0",
+      "available": ["1.0"],
+      "constraints": []
+    }
+  ]
+}
+```
+
+遍历细节：
+
+- `missing` / `unavailable` 是**遍历断点**——锁中没有该包、或锁定版本不在
+  快照时，无法得知它的依赖声明，因此不沿其继续展开；只经这些断点才可到达
+  的锁中包会报 `extraneous`。
+- `constraint_mismatch` **不阻断遍历**：锁定版本仍在快照中，其声明的依赖
+  照常展开（一份锁可以同时有约束不满足和下游缺包）。
+- marker 无论激活与否都做语法与变量范围校验，非法 marker 仍返回 **422**
+  （与 `/resolve` 一致）；只有求值为真的依赖进入遍历。
+
+`/audit-lock` 的状态码：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 审计完成（`valid` 为 `true` 或 `false` 都是 200；审计不产生 409） |
+| `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、同一规范化包名对应多个不同版本 |
+
 ---
 
 ## 三、解析规则说明
@@ -358,6 +484,10 @@ curl -s -X POST http://localhost:8000/upgrade \
    解析的版本；随后在该版本的所有有效解中枚举并保留“非目标包相对
    `current_lock` 变化数量最少”的解（分支定界剪枝，变化数相同按既定
    确定性顺序取先遇到者）。`/resolve` 的行为不受任何影响。
+10. **审计（`/audit-lock`）**：不求解，只按 `current_lock` 的锁定版本从根包
+    遍历已激活依赖：环中包只展开一次但累计全部入边约束；输出
+    missing / unavailable / constraint_mismatch / extraneous 四类确定性
+    排序的问题，包名按 PEP 503、版本与约束按 PEP 440 判断。
 
 ### 安全护栏
 
@@ -371,10 +501,11 @@ curl -s -X POST http://localhost:8000/upgrade \
 app/
   main.py        # FastAPI 路由与错误映射
   resolver.py    # 回溯求解器（候选排序 / MRV / 来源链重建）
+  audit.py       # 锁定清单审计（按锁版本遍历 / 环中累计入边 / 四类问题）
   repository.py  # 快照规范化、PEP 440/503 解析、按环境过滤 marker
   markers.py     # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
   schemas.py     # 请求/响应模型
-examples/        # curl 示例请求体（含跨环境 marker 与 /upgrade 示例）
+examples/        # curl 示例请求体（含跨环境 marker、/upgrade、/audit-lock 示例）
 tests/           # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
 Dockerfile
 docker-compose.yml
